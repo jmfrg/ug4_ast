@@ -36,11 +36,17 @@ Adapters / ablations:
     * time_first: flatten (t,f): [Tp, Fp]
     * freq_first: flatten (f,t): [Fp, Tp]
 - --freq_pool {mean,max,attn} (default=mean), only used when ctc_axis=time
+
+Decoding (evaluation only):
+- --decode {greedy,beam} (default=greedy)
+- --beam_size INT (default=20)
+- --beam_topk  INT (default=40): per-frame token expansion top-k (speed control)
+  (beam decoding is pure CTC prefix beam search, no LM)
 """
 
 from __future__ import annotations
 import os, time, random, argparse, re, math, json
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
@@ -403,6 +409,98 @@ def resize_ast_positional_embeddings(ast: ASTModel, freq_bins: int, max_frames: 
 
 
 # -------------------------
+# CTC decoding: greedy / prefix beam search (no LM)
+# -------------------------
+def _logsumexp(a: float, b: float) -> float:
+    if a == -float("inf"):
+        return b
+    if b == -float("inf"):
+        return a
+    if a > b:
+        return a + math.log1p(math.exp(b - a))
+    return b + math.log1p(math.exp(a - b))
+
+
+def ctc_prefix_beam_search(
+    log_probs: torch.Tensor,   # [T, V] log-probabilities (float32 on CPU recommended)
+    beam_size: int,
+    blank_id: int,
+    topk: int = 40,
+) -> List[int]:
+    """
+    Prefix beam search for CTC (no LM).
+    Returns best label sequence as a list of token ids (NO blanks).
+    Complexity: O(T * beam_size * topk)
+    """
+    assert log_probs.dim() == 2, f"log_probs must be [T,V], got {tuple(log_probs.shape)}"
+    T, V = log_probs.shape
+
+    beams: Dict[Tuple[int, ...], Tuple[float, float]] = {(): (0.0, -float("inf"))}  # (p_blank, p_nonblank)
+
+    topk = int(topk)
+    if topk <= 0:
+        topk = V
+    topk = min(topk, V)
+
+    for t in range(T):
+        next_beams: Dict[Tuple[int, ...], Tuple[float, float]] = {}
+
+        lp_t = log_probs[t]  # [V]
+        if topk < V:
+            topv, topi = torch.topk(lp_t, k=topk)
+            topi = topi.tolist()
+            topv = topv.tolist()
+        else:
+            topi = list(range(V))
+            topv = lp_t.tolist()
+
+        for prefix, (pb, pnb) in beams.items():
+            p_total = _logsumexp(pb, pnb)
+
+            for c, lp in zip(topi, topv):
+                if c == blank_id:
+                    nb_pb, nb_pnb = next_beams.get(prefix, (-float("inf"), -float("inf")))
+                    nb_pb = _logsumexp(nb_pb, p_total + lp)
+                    next_beams[prefix] = (nb_pb, nb_pnb)
+                    continue
+
+                last = prefix[-1] if len(prefix) > 0 else None
+                new_prefix = prefix + (c,)
+
+                if last == c:
+                    # stay at prefix from nonblank
+                    nb_pb, nb_pnb = next_beams.get(prefix, (-float("inf"), -float("inf")))
+                    nb_pnb = _logsumexp(nb_pnb, pnb + lp)
+                    next_beams[prefix] = (nb_pb, nb_pnb)
+
+                    # extend from blank only
+                    nb_pb2, nb_pnb2 = next_beams.get(new_prefix, (-float("inf"), -float("inf")))
+                    nb_pnb2 = _logsumexp(nb_pnb2, pb + lp)
+                    next_beams[new_prefix] = (nb_pb2, nb_pnb2)
+                else:
+                    nb_pb2, nb_pnb2 = next_beams.get(new_prefix, (-float("inf"), -float("inf")))
+                    nb_pnb2 = _logsumexp(nb_pnb2, p_total + lp)
+                    next_beams[new_prefix] = (nb_pb2, nb_pnb2)
+
+        # prune
+        scored = []
+        for pfx, (pb, pnb) in next_beams.items():
+            scored.append((pfx, _logsumexp(pb, pnb)))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        beams = {pfx: next_beams[pfx] for pfx, _ in scored[:beam_size]}
+
+    best_prefix = max(beams.items(), key=lambda kv: _logsumexp(kv[1][0], kv[1][1]))[0]
+    return list(best_prefix)
+
+
+def ids_to_text(tokenizer, ids: List[int]) -> str:
+    toks = tokenizer.convert_ids_to_tokens(ids)
+    toks = [t for t in toks if t not in ("<pad>", "<unk>")]
+    s = "".join(toks).replace("|", " ")
+    return s
+
+
+# -------------------------
 # AST + CTC model
 # -------------------------
 class ASTCTCModel(nn.Module):
@@ -498,7 +596,7 @@ class ASTCTCModel(nn.Module):
                 # freq-first flatten: [B, Fp, Tp, H] -> [B, Fp*Tp, H]
                 tok_hs = patch_hs.reshape(Bp, Fp * Tp, -1)
 
-            logits = self.lm_head(tok_hs)  # [B', Tp*Fp, V] (or [B', Fp*Tp, V], same length)
+            logits = self.lm_head(tok_hs)
             return logits
 
         # ctc_axis == "time": frequency pooling -> [B', Tp, H]
@@ -516,7 +614,7 @@ class ASTCTCModel(nn.Module):
         if r > 1:
             time_hs = time_hs.repeat_interleave(r, dim=1)  # [B', Tp*r, H]
 
-        logits = self.lm_head(time_hs)  # [B', Tp*r, V]
+        logits = self.lm_head(time_hs)
         return logits
 
 
@@ -692,6 +790,9 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     pad_token_id: int,
+    decode: str = "greedy",
+    beam_size: int = 20,
+    beam_topk: int = 40,
 ):
     model.eval()
     total_loss = 0.0
@@ -725,18 +826,33 @@ def evaluate(
 
         utt_logits, input_lengths = assemble_utt_logits(chunk_logits, chunk_out_lens, utt_slices)
 
-        log_probs = utt_logits.log_softmax(dim=-1).transpose(0, 1)
-        loss = ctc_loss(log_probs.float(), targets, input_lengths, target_lengths)
+        log_probs_TBV = utt_logits.log_softmax(dim=-1).transpose(0, 1)  # [T,B,V]
+        loss = ctc_loss(log_probs_TBV.float(), targets, input_lengths, target_lengths)
 
         total_loss += float(loss.item())
         n_batches += 1
 
-        pred_ids = torch.argmax(utt_logits, dim=-1)  # [B, max_T]
-        for i, L in enumerate(input_lengths.tolist()):
-            if L < pred_ids.size(1):
-                pred_ids[i, L:] = pad_token_id  # blank
-
-        pred_str = processor.batch_decode(pred_ids)
+        # ---- decode ----
+        decode = str(decode)
+        if decode == "beam":
+            # per-utt beam search on CPU float32
+            lp_btv = utt_logits.log_softmax(dim=-1)  # [B, T, V]
+            B = lp_btv.size(0)
+            pred_str: List[str] = []
+            for i in range(B):
+                L = int(input_lengths[i].item())
+                lp_tv = lp_btv[i, :L, :].detach().to("cpu", dtype=torch.float32)  # [T,V]
+                best_ids = ctc_prefix_beam_search(
+                    lp_tv, beam_size=int(beam_size), blank_id=pad_token_id, topk=int(beam_topk)
+                )
+                pred_str.append(ids_to_text(processor.tokenizer, best_ids))
+        else:
+            # greedy
+            pred_ids = torch.argmax(utt_logits, dim=-1)  # [B, max_T]
+            for i, L in enumerate(input_lengths.tolist()):
+                if L < pred_ids.size(1):
+                    pred_ids[i, L:] = pad_token_id  # blank
+            pred_str = processor.batch_decode(pred_ids)
 
         refs_norm = [normalize_text_for_wer(s) for s in texts]
         hyps_norm = [normalize_text_for_wer(s) for s in pred_str]
@@ -811,6 +927,14 @@ def main():
     ap.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
     ap.add_argument("--seed", type=int, default=42)
 
+    # decoding (eval only)
+    ap.add_argument("--decode", type=str, default="greedy", choices=["greedy", "beam"],
+                    help="Decoding for evaluation: greedy or CTC prefix beam search (no LM).")
+    ap.add_argument("--beam_size", type=int, default=20,
+                    help="Beam size for --decode beam.")
+    ap.add_argument("--beam_topk", type=int, default=40,
+                    help="Per-frame token expansion top-k for beam search (speed control).")
+
     # output
     ap.add_argument("--out_dir", type=str, required=True)
 
@@ -832,6 +956,8 @@ def main():
     cache_dir = _infer_hf_cache_dir(args.hf_cache_dir)
     offline = _infer_offline_flag(args.offline)
     print(f"[AST-CTC] HF cache_dir: {cache_dir} | offline={offline}")
+
+    print(f"[AST-CTC] decode={args.decode} beam_size={args.beam_size} beam_topk={args.beam_topk}")
 
     print(f"[AST-CTC] Loading AST FeatureExtractor for {args.ast_ckpt}")
     ast_feat_extractor = AutoFeatureExtractor.from_pretrained(
@@ -939,7 +1065,10 @@ def main():
             debug_first_batch=(ep == 1),
             drop_invalid=True,
         )
-        val_loss, val_wer, val_cer, vrefs, vhyps = evaluate(model, processor, val_ld, device, pad_token_id)
+        val_loss, val_wer, val_cer, vrefs, vhyps = evaluate(
+            model, processor, val_ld, device, pad_token_id,
+            decode=args.decode, beam_size=args.beam_size, beam_topk=args.beam_topk
+        )
         dt = time.time() - t0
         print(f"[AST-CTC] Epoch {ep:02d} | train loss {tr_loss:.4f} | "
               f"val loss {val_loss:.4f} | val WER {val_wer*100:.2f}% | CER {val_cer*100:.2f}% | "
@@ -963,9 +1092,15 @@ def main():
             "val_cer": float(val_cer),
             "lr_head": float(optimizer.param_groups[0]["lr"]),
             "lr_enc": float(optimizer.param_groups[1]["lr"]),
+            "decode": str(args.decode),
+            "beam_size": int(args.beam_size),
+            "beam_topk": int(args.beam_topk),
         })
 
-    test_loss, test_wer, test_cer, trefs, thyps = evaluate(model, processor, test_ld, device, pad_token_id)
+    test_loss, test_wer, test_cer, trefs, thyps = evaluate(
+        model, processor, test_ld, device, pad_token_id,
+        decode=args.decode, beam_size=args.beam_size, beam_topk=args.beam_topk
+    )
     print(f"[AST-CTC] Test: loss {test_loss:.4f} | WER {test_wer*100:.2f}% | CER {test_cer*100:.2f}%")
     for i in range(min(3, len(trefs))):
         print(f"  [test-{i}] REF: {trefs[i]}")
@@ -985,6 +1120,9 @@ def main():
         f.write(f"ctc_axis: {args.ctc_axis}\n")
         f.write(f"token_order: {args.token_order}\n")
         f.write(f"freq_pool: {args.freq_pool}\n")
+        f.write(f"decode: {args.decode}\n")
+        f.write(f"beam_size: {args.beam_size}\n")
+        f.write(f"beam_topk: {args.beam_topk}\n")
         f.write(f"lr_head={args.lr_head} lr_enc={args.lr_enc} warmup_head_epochs={args.warmup_head_epochs}\n")
         f.write(f"Train split: {args.train_split}\nVal split: {args.val_split}\nTest split: {args.test_split}\n")
         f.write(f"Max train/val/test utts: {args.max_train_utts}/{args.max_val_utts}/{args.max_test_utts}\n")
