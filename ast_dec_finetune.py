@@ -112,6 +112,8 @@ def build_processor_from_vocab_dir(vocab_dir: str) -> Wav2Vec2Processor:
         pad_token="<pad>",
         word_delimiter_token="|",
         do_lower_case=False,
+        bos_token="<bos>",
+        eos_token="<eos>",
     )
 
     feature_extractor = Wav2Vec2FeatureExtractor(
@@ -462,6 +464,8 @@ class ASTDecModel(nn.Module):
         ast: ASTModel,
         vocab_size: int,
         pad_token_id: int,
+        bos_token_id: int,
+        eos_token_id: int,
         freq_bins: int = 128,
         max_frames: int = 1024,
         upsample_factor: int = 1,
@@ -512,10 +516,11 @@ class ASTDecModel(nn.Module):
 
         self.vocab_size = int(vocab_size)
         self.pad_token_id = int(pad_token_id)
-        self.bos_id = int(vocab_size)
+        self.bos_id = int(bos_token_id)
+        self.eos_id = int(eos_token_id)
 
         d_model = int(ast.config.hidden_size)
-        self.tok_emb = nn.Embedding(self.vocab_size + 1, d_model, padding_idx=self.pad_token_id)
+        self.tok_emb = nn.Embedding(self.vocab_size, d_model, padding_idx=self.pad_token_id)
         self.decoder = TransformerDecoder(
             d_model=d_model,
             nhead=int(dec_heads),
@@ -527,9 +532,9 @@ class ASTDecModel(nn.Module):
         self.out_proj = nn.Linear(d_model, self.vocab_size, bias=False)
 
         if tie_output:
-            if self.tok_emb.weight.shape[0] != self.vocab_size + 1:
+            if self.tok_emb.weight.shape[0] != self.vocab_size:
                 raise RuntimeError("unexpected embedding shape")
-            self.out_proj.weight = nn.Parameter(self.tok_emb.weight[: self.vocab_size].data)
+            self.out_proj.weight = nn.Parameter(self.tok_emb.weight.data)
 
     def _grid(self, F_bins: int, T_frames: int) -> Tuple[int, int, int]:
         Fp = (F_bins - self.k_f) // self.s_f + 1
@@ -680,16 +685,28 @@ def shift_right_with_bos(label_ids: torch.Tensor, pad_id: int, bos_id: int) -> t
         dec_in[:, 1:] = label_ids[:, :-1]
     return dec_in
 
+def append_eos_inplace(label_ids: torch.Tensor, pad_id: int, eos_id: int) -> torch.Tensor:
+    # label_ids: [B, L] padded
+    B, L = label_ids.shape
+    out = label_ids.clone()
+    for b in range(B):
+        row = out[b]
+        pad_pos = (row == pad_id).nonzero(as_tuple=False)
+        if pad_pos.numel() > 0:
+            j = int(pad_pos[0].item())
+            row[j] = eos_id
+        else:
+            row[L - 1] = eos_id
+    return out
 
 # -------------------------
 # Greedy decoding + text conversion
 # -------------------------
 def ids_to_text(tokenizer, ids: List[int]) -> str:
     toks = tokenizer.convert_ids_to_tokens(ids)
-    toks = [t for t in toks if t not in ("<pad>", "<unk>")]
+    toks = [t for t in toks if t not in ("<pad>", "<unk>", "<bos>", "<eos>")]
     s = "".join(toks).replace("|", " ")
     return s
-
 
 @torch.no_grad()
 def greedy_decode(
@@ -715,14 +732,18 @@ def greedy_decode(
             return_cross_attn=False,
         )
         next_id = torch.argmax(logits[:, -1, :], dim=-1)
+
+        # finished 的句子后续全部 pad
         next_id = torch.where(finished, torch.full_like(next_id, model.pad_token_id), next_id)
+
         ys = torch.cat([ys, next_id.unsqueeze(1)], dim=1)
-        finished = finished | (next_id == model.pad_token_id)
+
+
+        finished = finished | (next_id == model.eos_id)
         if bool(finished.all()):
             break
 
-    return ys[:, 1:]
-
+    return ys[:, 1:]  # 去掉起始 bos
 
 # -------------------------
 # Attention map saving
@@ -779,7 +800,13 @@ def train_one_epoch(
         global_step += 1
         optimizer.zero_grad(set_to_none=True)
 
-        label_ids = processor(text=texts, return_tensors="pt", padding=True).input_ids.to(device)
+        enc = processor(text=texts, return_tensors=None, padding=False)
+        seqs = [ids + [model.eos_id] for ids in enc["input_ids"]]
+        maxL = max(len(s) for s in seqs)
+        label_ids = torch.full((len(seqs), maxL), pad_token_id, dtype=torch.long)
+        for i,s in enumerate(seqs):
+            label_ids[i, :len(s)] = torch.tensor(s, dtype=torch.long)
+        label_ids = label_ids.to(device)
 
         chunk_fbanks = chunk_fbanks.to(device)
         chunk_frame_lens = chunk_frame_lens.to(device)
@@ -898,7 +925,13 @@ def evaluate(
     saved_any_attn = False
 
     for chunk_fbanks, chunk_frame_lens, chunk_attn_mask, utt_slices, texts in loader:
-        label_ids = processor(text=texts, return_tensors="pt", padding=True).input_ids.to(device)
+        enc = processor(text=texts, return_tensors=None, padding=False)
+        seqs = [ids + [model.eos_id] for ids in enc["input_ids"]]
+        maxL = max(len(s) for s in seqs)
+        label_ids = torch.full((len(seqs), maxL), pad_token_id, dtype=torch.long)
+        for i,s in enumerate(seqs):
+            label_ids[i, :len(s)] = torch.tensor(s, dtype=torch.long)
+        label_ids = label_ids.to(device)
 
         chunk_fbanks = chunk_fbanks.to(device)
         chunk_frame_lens = chunk_frame_lens.to(device)
@@ -1053,9 +1086,13 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     processor = build_processor_from_vocab_dir(args.vocab_dir)
+    bos_id = processor.tokenizer.bos_token_id
+    eos_id = processor.tokenizer.eos_token_id
+    
     pad_token_id = processor.tokenizer.pad_token_id
     vocab_size = len(processor.tokenizer)
-    print(f"[AST-DEC] vocab_size={vocab_size} pad_token_id={pad_token_id} bos_id={vocab_size}")
+    print(f"[AST-DEC] vocab_size={vocab_size} pad_token_id={pad_token_id} bos_id={bos_id} eos_id={eos_id}")
+    print("[TOK DEBUG]", [processor.tokenizer.convert_ids_to_tokens(i) for i in range(40)])
 
     cache_dir = _infer_hf_cache_dir(args.hf_cache_dir)
     offline = _infer_offline_flag(args.offline)
@@ -1090,6 +1127,8 @@ def main():
         ast=ast,
         vocab_size=vocab_size,
         pad_token_id=pad_token_id,
+        bos_token_id=bos_id,
+        eos_token_id=eos_id,
         freq_bins=args.freq_bins,
         max_frames=args.max_frames,
         upsample_factor=args.upsample_factor,
