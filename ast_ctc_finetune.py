@@ -19,6 +19,10 @@ Key features / fixes:
 - Offline/HPC safe: validates local LibriSpeech; HF cache_dir + offline/local_files_only support
 - Save training_history.json (per-epoch metrics + per-group LR)
 
+Chunking (NEW):
+- --chunk_overlap N : sliding-window chunking on mel frames with overlap N frames
+- --dedup_overlap   : when overlap>0, drop left overlap region of logits for non-first chunks (reduce duplication)
+
 Input preprocessing:
 - Uses AST's official FeatureExtractor (AutoFeatureExtractor.from_pretrained(ast_ckpt)) to produce
   log-mel features consistent with the checkpoint.
@@ -299,30 +303,54 @@ def wav_to_ast_features(
     return x
 
 
-def chunk_and_pad_feat(feat: torch.Tensor, max_frames: int = 1024) -> Tuple[torch.Tensor, List[int]]:
+def chunk_and_pad_feat(
+    feat: torch.Tensor,
+    max_frames: int = 1024,
+    overlap: int = 0,
+) -> Tuple[torch.Tensor, List[int]]:
     """
+    Sliding-window chunking with optional overlap on frame axis.
+
     feat: [T, 128]
-    returns: chunks [n_chunks, max_frames, 128], lens list[int]
+    overlap: number of frames overlapped between consecutive chunks (0..max_frames-1)
+
+    returns:
+      chunks: [n_chunks, max_frames, 128] (padded)
+      lens:   list[int] valid frame lengths for each chunk (<= max_frames)
     """
     T = feat.size(0)
+
+    if overlap < 0 or overlap >= max_frames:
+        raise ValueError(f"overlap must be in [0, max_frames-1], got {overlap} with max_frames={max_frames}")
+
+    stride = max_frames - overlap
+
     if T <= max_frames:
         chunk = torch.zeros((max_frames, feat.size(1)), dtype=feat.dtype)
         chunk[:T] = feat
         return chunk.unsqueeze(0), [T]
 
-    n_chunks = math.ceil(T / max_frames)
-    chunks = torch.zeros((n_chunks, max_frames, feat.size(1)), dtype=feat.dtype)
-    lens = []
-    for k in range(n_chunks):
-        s = k * max_frames
-        e = min((k + 1) * max_frames, T)
-        cur = feat[s:e]
-        chunks[k, : (e - s)] = cur
-        lens.append(e - s)
-    return chunks, lens
+    chunks: List[torch.Tensor] = []
+    lens: List[int] = []
+    start = 0
+    while start < T:
+        end = min(start + max_frames, T)
+        cur = feat[start:end]
+        L = end - start
+
+        buf = torch.zeros((max_frames, feat.size(1)), dtype=feat.dtype)
+        buf[:L] = cur
+        chunks.append(buf)
+        lens.append(L)
+
+        if end == T:
+            break
+        start += stride
+
+    return torch.stack(chunks, dim=0), lens
 
 
-def collate_ast_ctc(batch, max_frames: int, ast_feature_extractor):
+def collate_ast_ctc(batch, max_frames: int, ast_feature_extractor, chunk_overlap: int = 0):
     """
     Returns:
       chunk_fbanks:      [B_total_chunks, max_frames, 128]
@@ -341,7 +369,7 @@ def collate_ast_ctc(batch, max_frames: int, ast_feature_extractor):
 
     for wav in waves:
         feat = wav_to_ast_features(wav, ast_feature_extractor, 16000)  # [frames, 128]
-        chunks, lens = chunk_and_pad_feat(feat, max_frames=max_frames)
+        chunks, lens = chunk_and_pad_feat(feat, max_frames=max_frames, overlap=chunk_overlap)
         n = chunks.size(0)
         all_chunks.append(chunks)
         all_lens.extend(lens)
@@ -468,12 +496,10 @@ def ctc_prefix_beam_search(
                 new_prefix = prefix + (c,)
 
                 if last == c:
-                    # stay at prefix from nonblank
                     nb_pb, nb_pnb = next_beams.get(prefix, (-float("inf"), -float("inf")))
                     nb_pnb = _logsumexp(nb_pnb, pnb + lp)
                     next_beams[prefix] = (nb_pb, nb_pnb)
 
-                    # extend from blank only
                     nb_pb2, nb_pnb2 = next_beams.get(new_prefix, (-float("inf"), -float("inf")))
                     nb_pnb2 = _logsumexp(nb_pnb2, pb + lp)
                     next_beams[new_prefix] = (nb_pb2, nb_pnb2)
@@ -482,7 +508,6 @@ def ctc_prefix_beam_search(
                     nb_pnb2 = _logsumexp(nb_pnb2, p_total + lp)
                     next_beams[new_prefix] = (nb_pb2, nb_pnb2)
 
-        # prune
         scored = []
         for pfx, (pb, pnb) in next_beams.items():
             scored.append((pfx, _logsumexp(pb, pnb)))
@@ -564,7 +589,7 @@ class ASTCTCModel(nn.Module):
         """
         input:
           fbank_chunk: [B', max_frames, 128]
-          attention_mask: [B', max_frames] (frame-level; helps in your setup)
+          attention_mask: [B', max_frames]
         output:
           if ctc_axis=time  : logits [B', Tp*upsample, V]
           if ctc_axis=token : logits [B', Tp*Fp, V]  (flatten order controlled by token_order)
@@ -585,26 +610,23 @@ class ASTCTCModel(nn.Module):
                 f"(Fp={Fp},Tp={Tp}, kernel=({self.k_f},{self.k_t}), stride=({self.s_f},{self.s_t}))"
             )
 
-        # patches: [B', Fp, Tp, H]
-        patch_hs = hs[:, special:, :].view(Bp, Fp, Tp, -1)
+        patch_hs = hs[:, special:, :].view(Bp, Fp, Tp, -1)  # [B', Fp, Tp, H]
 
         if self.ctc_axis == "token":
             if self.token_order == "time_first":
-                # time-first flatten: [B, Fp, Tp, H] -> [B, Tp, Fp, H] -> [B, Tp*Fp, H]
-                tok_hs = patch_hs.permute(0, 2, 1, 3).reshape(Bp, Tp * Fp, -1)
+                tok_hs = patch_hs.permute(0, 2, 1, 3).reshape(Bp, Tp * Fp, -1)  # [B', Tp*Fp, H]
             else:
-                # freq-first flatten: [B, Fp, Tp, H] -> [B, Fp*Tp, H]
-                tok_hs = patch_hs.reshape(Bp, Fp * Tp, -1)
+                tok_hs = patch_hs.reshape(Bp, Fp * Tp, -1)  # [B', Fp*Tp, H] same length
 
             logits = self.lm_head(tok_hs)
             return logits
 
-        # ctc_axis == "time": frequency pooling -> [B', Tp, H]
+        # ctc_axis == "time": pool freq -> [B', Tp, H]
         if self.freq_pool == "mean":
             time_hs = patch_hs.mean(dim=1)
         elif self.freq_pool == "max":
             time_hs = patch_hs.max(dim=1).values
-        else:  # attn
+        else:
             x = patch_hs.permute(0, 2, 1, 3)                 # [B', Tp, Fp, H]
             scores = self.freq_attn(x).squeeze(-1)           # [B', Tp, Fp]
             alpha = torch.softmax(scores, dim=-1)            # [B', Tp, Fp]
@@ -635,11 +657,6 @@ def compute_chunk_output_lens(
     upsample_factor: int,
     Fp: int,
 ) -> torch.Tensor:
-    """
-    Returns per-chunk valid output lengths in the logits time dimension.
-      - time axis : Tp_valid * upsample_factor
-      - token axis: Tp_valid * Fp  (valid time patches across all frequencies; order independent)
-    """
     tp_valid = compute_time_patch_lens(frame_lens, k_t, s_t)  # [B_chunks]
     if ctc_axis == "token":
         return (tp_valid * int(Fp)).to(torch.long)
@@ -648,8 +665,9 @@ def compute_chunk_output_lens(
 
 def assemble_utt_logits(
     chunk_logits: torch.Tensor,           # [B_total_chunks, T_max, V]
-    chunk_out_lens: torch.Tensor,         # [B_total_chunks] valid T for each chunk
+    chunk_out_lens: torch.Tensor,         # [B_total_chunks]
     utt_slices: List[Tuple[int, int]],    # per utterance: (start_idx, n_chunks)
+    drop_left: int = 0,                   # drop this many output steps for non-first chunks
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = chunk_logits.device
     B = len(utt_slices)
@@ -663,15 +681,25 @@ def assemble_utt_logits(
         for k in range(n):
             idx = s + k
             Lk = int(chunk_out_lens[idx].item())
-            parts.append(chunk_logits[idx, :Lk, :])
-            total += Lk
+            seg = chunk_logits[idx, :Lk, :]
+
+            if drop_left > 0 and k > 0:
+                if drop_left < seg.size(0):
+                    seg = seg[drop_left:, :]
+                else:
+                    seg = seg[:0, :]  # rare: overlap too large for short chunk
+
+            parts.append(seg)
+            total += seg.size(0)
+
         utt_lens.append(total)
-        utt_seqs.append(torch.cat(parts, dim=0))  # [total, V]
+        utt_seqs.append(torch.cat(parts, dim=0) if len(parts) > 0 else torch.zeros((0, V), device=device))
 
     max_T = max(utt_lens) if utt_lens else 0
     padded = torch.zeros((B, max_T, V), device=device, dtype=chunk_logits.dtype)
     for i, seq in enumerate(utt_seqs):
-        padded[i, : seq.size(0)] = seq
+        if seq.numel() > 0:
+            padded[i, : seq.size(0)] = seq
 
     return padded, torch.tensor(utt_lens, device=device, dtype=torch.long)
 
@@ -692,6 +720,9 @@ def train_one_epoch(
     global_step_start: int = 0,
     debug_first_batch: bool = True,
     drop_invalid: bool = True,
+    # overlap controls
+    chunk_overlap: int = 0,
+    dedup_overlap: bool = False,
 ):
     model.train()
     total_loss = 0.0
@@ -732,12 +763,24 @@ def train_one_epoch(
             Fp=Fp,
         )
 
-        utt_logits, input_lengths = assemble_utt_logits(chunk_logits, chunk_out_lens, utt_slices)
+        # dedup overlap (output steps)
+        drop_left = 0
+        if chunk_overlap > 0 and dedup_overlap:
+            overlap_tp = max(0, int(chunk_overlap // max(model.s_t, 1)))
+            if model.ctc_axis == "token":
+                drop_left = overlap_tp * int(Fp)
+            else:
+                drop_left = overlap_tp * int(model.upsample_factor)
+
+        utt_logits, input_lengths = assemble_utt_logits(
+            chunk_logits, chunk_out_lens, utt_slices, drop_left=drop_left
+        )
 
         if debug_first_batch and global_step == global_step_start + 1:
             print("[DEBUG] chunk_fbanks:", tuple(chunk_fbanks.shape))
             print("[DEBUG] chunk_frame_lens min/max:", int(chunk_frame_lens.min()), int(chunk_frame_lens.max()))
             print("[DEBUG] chunk_out_lens   min/max:", int(chunk_out_lens.min()), int(chunk_out_lens.max()))
+            print("[DEBUG] drop_left(out_steps):", int(drop_left))
             print("[DEBUG] utt_logits:", tuple(utt_logits.shape))
             print("[DEBUG] input_lengths  min/max:", int(input_lengths.min()), int(input_lengths.max()))
             print("[DEBUG] target_lengths min/max:", int(target_lengths.min()), int(target_lengths.max()))
@@ -793,6 +836,9 @@ def evaluate(
     decode: str = "greedy",
     beam_size: int = 20,
     beam_topk: int = 40,
+    # overlap controls
+    chunk_overlap: int = 0,
+    dedup_overlap: bool = False,
 ):
     model.eval()
     total_loss = 0.0
@@ -824,7 +870,17 @@ def evaluate(
             Fp=Fp,
         )
 
-        utt_logits, input_lengths = assemble_utt_logits(chunk_logits, chunk_out_lens, utt_slices)
+        drop_left = 0
+        if chunk_overlap > 0 and dedup_overlap:
+            overlap_tp = max(0, int(chunk_overlap // max(model.s_t, 1)))
+            if model.ctc_axis == "token":
+                drop_left = overlap_tp * int(Fp)
+            else:
+                drop_left = overlap_tp * int(model.upsample_factor)
+
+        utt_logits, input_lengths = assemble_utt_logits(
+            chunk_logits, chunk_out_lens, utt_slices, drop_left=drop_left
+        )
 
         log_probs_TBV = utt_logits.log_softmax(dim=-1).transpose(0, 1)  # [T,B,V]
         loss = ctc_loss(log_probs_TBV.float(), targets, input_lengths, target_lengths)
@@ -835,7 +891,6 @@ def evaluate(
         # ---- decode ----
         decode = str(decode)
         if decode == "beam":
-            # per-utt beam search on CPU float32
             lp_btv = utt_logits.log_softmax(dim=-1)  # [B, T, V]
             B = lp_btv.size(0)
             pred_str: List[str] = []
@@ -847,7 +902,6 @@ def evaluate(
                 )
                 pred_str.append(ids_to_text(processor.tokenizer, best_ids))
         else:
-            # greedy
             pred_ids = torch.argmax(utt_logits, dim=-1)  # [B, max_T]
             for i, L in enumerate(input_lengths.tolist()):
                 if L < pred_ids.size(1):
@@ -885,6 +939,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--no_shuffle", action="store_true", help="Do not shuffle dataset indices before truncation.")
 
+    # chunking (NEW)
+    ap.add_argument("--chunk_overlap", type=int, default=0,
+                    help="Overlap in frames between consecutive chunks (0 means no overlap).")
+    ap.add_argument("--dedup_overlap", action="store_true",
+                    help="When overlap>0, drop the overlapped part of logits for non-first chunks.")
+
     # AST / features
     ap.add_argument("--ast_ckpt", type=str, default="MIT/ast-finetuned-audioset-10-10-0.4593")
     ap.add_argument("--ast_from_scratch", action="store_true")
@@ -900,7 +960,6 @@ def main():
     ap.add_argument("--freq_pool", type=str, default="mean", choices=["mean", "max", "attn"],
                     help="Pool frequency patches into a 1D time sequence for CTC (only used if ctc_axis=time).")
 
-    # temporal upsampling (only meaningful for ctc_axis=time)
     ap.add_argument("--upsample_factor", type=int, default=4,
                     help="repeat_interleave factor on time tokens for CTC (ctc_axis=time)")
 
@@ -958,6 +1017,7 @@ def main():
     print(f"[AST-CTC] HF cache_dir: {cache_dir} | offline={offline}")
 
     print(f"[AST-CTC] decode={args.decode} beam_size={args.beam_size} beam_topk={args.beam_topk}")
+    print(f"[AST-CTC] chunk_overlap={args.chunk_overlap} dedup_overlap={args.dedup_overlap}")
 
     print(f"[AST-CTC] Loading AST FeatureExtractor for {args.ast_ckpt}")
     ast_feat_extractor = AutoFeatureExtractor.from_pretrained(
@@ -1030,7 +1090,12 @@ def main():
     test_ds  = LibriSpeechWaveText(args.data_root, args.test_split,  max_test,  shuffle=shuffle)
     print(f"[AST-CTC] dataset sizes: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
 
-    collate_fn = lambda b: collate_ast_ctc(b, max_frames=args.max_frames, ast_feature_extractor=ast_feat_extractor)
+    collate_fn = lambda b: collate_ast_ctc(
+        b,
+        max_frames=args.max_frames,
+        ast_feature_extractor=ast_feat_extractor,
+        chunk_overlap=args.chunk_overlap,
+    )
 
     train_ld = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                           num_workers=args.num_workers, collate_fn=collate_fn)
@@ -1064,11 +1129,17 @@ def main():
             global_step_start=global_step,
             debug_first_batch=(ep == 1),
             drop_invalid=True,
+            chunk_overlap=args.chunk_overlap,
+            dedup_overlap=args.dedup_overlap,
         )
+
         val_loss, val_wer, val_cer, vrefs, vhyps = evaluate(
             model, processor, val_ld, device, pad_token_id,
-            decode=args.decode, beam_size=args.beam_size, beam_topk=args.beam_topk
+            decode=args.decode, beam_size=args.beam_size, beam_topk=args.beam_topk,
+            chunk_overlap=args.chunk_overlap,
+            dedup_overlap=args.dedup_overlap,
         )
+
         dt = time.time() - t0
         print(f"[AST-CTC] Epoch {ep:02d} | train loss {tr_loss:.4f} | "
               f"val loss {val_loss:.4f} | val WER {val_wer*100:.2f}% | CER {val_cer*100:.2f}% | "
@@ -1095,11 +1166,15 @@ def main():
             "decode": str(args.decode),
             "beam_size": int(args.beam_size),
             "beam_topk": int(args.beam_topk),
+            "chunk_overlap": int(args.chunk_overlap),
+            "dedup_overlap": bool(args.dedup_overlap),
         })
 
     test_loss, test_wer, test_cer, trefs, thyps = evaluate(
         model, processor, test_ld, device, pad_token_id,
-        decode=args.decode, beam_size=args.beam_size, beam_topk=args.beam_topk
+        decode=args.decode, beam_size=args.beam_size, beam_topk=args.beam_topk,
+        chunk_overlap=args.chunk_overlap,
+        dedup_overlap=args.dedup_overlap,
     )
     print(f"[AST-CTC] Test: loss {test_loss:.4f} | WER {test_wer*100:.2f}% | CER {test_cer*100:.2f}%")
     for i in range(min(3, len(trefs))):
@@ -1123,6 +1198,8 @@ def main():
         f.write(f"decode: {args.decode}\n")
         f.write(f"beam_size: {args.beam_size}\n")
         f.write(f"beam_topk: {args.beam_topk}\n")
+        f.write(f"chunk_overlap(frames): {args.chunk_overlap}\n")
+        f.write(f"dedup_overlap: {args.dedup_overlap}\n")
         f.write(f"lr_head={args.lr_head} lr_enc={args.lr_enc} warmup_head_epochs={args.warmup_head_epochs}\n")
         f.write(f"Train split: {args.train_split}\nVal split: {args.val_split}\nTest split: {args.test_split}\n")
         f.write(f"Max train/val/test utts: {args.max_train_utts}/{args.max_val_utts}/{args.max_test_utts}\n")
