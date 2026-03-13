@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Stage 2 multitask training (non-T2TT subset) for Qwen-style causal LM.
+Stage 2 multitask training (non-T2TT subset) for Qwen-style causal LM, with LoRA.
 
 Tasks included:
 - PR   : speech_tokens -> phoneme_token_text
@@ -17,6 +17,7 @@ Design choices:
 - No packing
 - Multitask joint training via plain concatenation of all train files
 - Labels are masked on the prompt/user part; only assistant response contributes to loss
+- Use LoRA for parameter-efficient stage2 training
 
 Expected data layout:
 stage2_data/
@@ -30,19 +31,6 @@ stage2_data/
   es/
   sl/
   sv-SE/
-
-Expected fields in each jsonl record:
-{
-  "id": "...",
-  "task": "PR" | "ASR" | "G2P" | "P2G",
-  "language": "de" | "es" | "sl" | "sv",
-  "input": "...",
-  "target": "...",
-  "speech_tokens": "...",              # optional but expected in your current pipeline
-  "phonemes": "...",                   # optional
-  "phoneme_token_text": "...",         # expected for PR/G2P/P2G in your current pipeline
-  "transcription": "..."               # optional
-}
 """
 
 from __future__ import annotations
@@ -65,16 +53,13 @@ from transformers import (
     default_data_collator,
 )
 
+from peft import LoraConfig, TaskType, get_peft_model
+
 
 # -------------------------
 # Task templates
 # -------------------------
 def build_messages(task: str, lang: str, inp: str, tgt: Optional[str] = None) -> List[Dict[str, str]]:
-    """
-    Build Qwen-style chat messages.
-    If tgt is None, only return the user message (used to get prompt length).
-    If tgt is not None, return user + assistant.
-    """
     task = task.upper().strip()
     lang = (lang or "unknown").strip()
 
@@ -216,12 +201,11 @@ class Stage2Dataset(Dataset):
                 raw_count += 1
                 local_count += 1
 
-                # prompt only
                 prompt_messages = build_messages(task=task, lang=lang, inp=inp, tgt=None)
                 prompt_text = tokenizer.apply_chat_template(
                     prompt_messages,
                     tokenize=False,
-                    add_generation_prompt=True,   # crucial: assistant starts here
+                    add_generation_prompt=True,
                 )
                 prompt_ids = tokenizer(
                     prompt_text,
@@ -230,7 +214,6 @@ class Stage2Dataset(Dataset):
                     padding=False,
                 )["input_ids"]
 
-                # full conversation
                 full_messages = build_messages(task=task, lang=lang, inp=inp, tgt=tgt)
                 full_text = tokenizer.apply_chat_template(
                     full_messages,
@@ -245,7 +228,6 @@ class Stage2Dataset(Dataset):
                 )["input_ids"]
 
                 if len(prompt_ids) >= len(full_ids):
-                    # something is wrong with template building
                     continue
 
                 if len(full_ids) > self.max_length:
@@ -341,13 +323,23 @@ def debug_model_and_tokenizer(tok, model):
 
 
 # -------------------------
+# LoRA helpers
+# -------------------------
+def parse_lora_target_modules(text: str) -> List[str]:
+    mods = [x.strip() for x in text.split(",") if x.strip()]
+    if not mods:
+        raise ValueError("LoRA target modules cannot be empty.")
+    return mods
+
+
+# -------------------------
 # Main
 # -------------------------
 def main():
     ap = argparse.ArgumentParser()
 
     # paths
-    ap.add_argument("--model_path", required=True, help="Stage1 checkpoint path (recommended) or model path")
+    ap.add_argument("--model_path", required=True, help="Stage1 checkpoint path")
     ap.add_argument("--data_root", required=True, help="Root of stage2_data")
     ap.add_argument("--out_dir", required=True)
 
@@ -359,7 +351,7 @@ def main():
     ap.add_argument("--limit_eval_per_file", type=int, default=None)
 
     # train
-    ap.add_argument("--lr", type=float, default=4e-5)
+    ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--num_train_epochs", type=float, default=2.0)
     ap.add_argument("--warmup_ratio", type=float, default=0.10)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
@@ -369,6 +361,17 @@ def main():
     ap.add_argument("--eval_steps", type=int, default=1000)
     ap.add_argument("--logging_steps", type=int, default=20)
     ap.add_argument("--save_total_limit", type=int, default=2)
+
+    # LoRA
+    ap.add_argument("--lora_r", type=int, default=16)
+    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj",
+        help="Comma-separated target modules for LoRA",
+    )
 
     # precision / runtime
     ap.add_argument("--bf16", action="store_true")
@@ -397,14 +400,17 @@ def main():
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    print("[Stage2] Loading model from:", args.model_path)
-    dtype = torch.bfloat16 if args.bf16 else None
+    print("[Stage2] Loading base model from:", args.model_path)
+    dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         local_files_only=True,
         trust_remote_code=True,
         dtype=dtype,
     )
+
+    if hasattr(model, "config"):
+        model.config.use_cache = False
 
     if args.gradient_checkpointing:
         print("[Stage2] enable gradient checkpointing")
@@ -414,11 +420,26 @@ def main():
             )
         except TypeError:
             model.gradient_checkpointing_enable()
-
-    if hasattr(model, "config"):
-        model.config.use_cache = False
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
     debug_model_and_tokenizer(tok, model)
+
+    lora_targets = parse_lora_target_modules(args.lora_target_modules)
+    print("[Stage2] Applying LoRA")
+    print(f"[Stage2] LoRA targets: {lora_targets}")
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=lora_targets,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+
     print_trainable_params(model)
 
     train_files = find_task_files(
@@ -461,7 +482,6 @@ def main():
             verbose=True,
         )
 
-    
     training_args = TrainingArguments(
         output_dir=args.out_dir,
         overwrite_output_dir=False,
